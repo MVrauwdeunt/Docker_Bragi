@@ -1,0 +1,1572 @@
+version: "3.7"
+
+########################### NETWORKS
+# You may customize the network subnet (192.168.90.0/24) below as you please.
+# Docker Compose version 3.5 or higher required to define networks this way.
+ 
+networks:
+  default:
+    driver: bridge
+  t2_proxy:
+    name: t2_proxy
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.90.0/24
+  socket_proxy:
+    name: socket_proxy
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.91.0/24
+########################### SECRETS
+secrets:
+  htpasswd:
+    file: $DOCKERDIR/secrets/htpasswd
+  cf_email:
+    file: $DOCKERDIR/secrets/cloudflare_email
+  cf_api_key:
+    file: $DOCKERDIR/secrets/cloudflare_api_key
+  cf_token:
+    file: $DOCKERDIR/secrets/cloudflare_api_token
+  mysql_root_password:
+    file: $DOCKERDIR/secrets/mysql_root_password
+  authelia_jwt_secret:
+    file: $SECRETSDIR/authelia_jwt_secret
+  authelia_session_secret:
+    file: $SECRETSDIR/authelia_session_secret
+  authelia_storage_mysql_password:
+    file: $SECRETSDIR/authelia_storage_mysql_password
+  authelia_notifier_smtp_password:
+    file: $SECRETSDIR/authelia_notifier_smtp_password
+  authelia_duo_api_secret_key:
+    file: $SECRETSDIR/authelia_duo_api_secret_key
+  redis_password:
+    file: $SECRETSDIR/redis_password
+  hydra_api_key:
+    file: $SECRETSDIR/hydra_api_key
+  guac_db_name:
+    file: $DOCKERDIR/secrets/guac_db_name
+  guac_mysql_user:
+    file: $DOCKERDIR/secrets/guac_mysql_user
+  guac_mysql_password:
+    file: $DOCKERDIR/secrets/guac_mysql_password
+  paperless_mysql_user:
+    file: $DOCKERDIR/secrets/paperless_mysql_user
+  paperless_mysql_password:
+    file: $DOCKERDIR/secrets/paperless_mysql_password
+########################### EXTENSION FIELDS
+# Helps eliminate repetition of sections
+# More Info on how to use this: https://github.com/htpcBeginner/docker-traefik/pull/228
+ 
+# Common environment values
+x-environment: &default-tz-puid-pgid
+  TZ: $TZ
+  PUID: $PUID
+  PGID: $PGID
+ 
+# Keys common to some of the core services that we always to automatically restart on failure
+x-common-keys-core: &common-keys-core
+  networks:
+    - t2_proxy
+  security_opt:
+    - no-new-privileges:true
+  restart: always
+ 
+# Keys common to some of the dependent services/apps
+x-common-keys-apps: &common-keys-apps
+  networks:
+    - t2_proxy
+  security_opt:
+    - no-new-privileges:true
+  restart: unless-stopped
+ 
+# Keys common to some of the services in media-services.txt
+x-common-keys-media: &common-keys-media
+  networks:
+    - t2_proxy
+  security_opt:
+    - no-new-privileges:true
+  restart: "no"
+
+
+########################### 
+
+services:
+
+############################# FRONTENDS
+
+# Traefik 2 - Reverse Proxy
+  # Touch (create empty files) traefik.log and acme/acme.json. Set acme.json permissions to 600.
+  # touch $DOCKERDIR/traefik2/acme/acme.json
+  # chmod 600 $DOCKERDIR/traefik2/acme/acme.json
+  # touch $DOCKERDIR/traefik2/traefik.log
+  traefik:
+    <<: *common-keys-core # See EXTENSION FIELDS at the top
+    container_name: traefik
+    image: traefik:latest
+    command: # CLI arguments
+      - --global.checkNewVersion=true
+      - --global.sendAnonymousUsage=true
+      - --entryPoints.http.address=:80
+      - --entryPoints.https.address=:443
+      # Allow these IPs to set the X-Forwarded-* headers - Cloudflare IPs: https://www.cloudflare.com/ips/
+      - --entrypoints.https.forwardedHeaders.trustedIPs=173.245.48.0/20,103.21.244.0/22,103.22.200.0/22,103.31.4.0/22,141.101.64.0/18,108.162.192.0/18,190.93.240.0/20,188.114.96.0/20,197.234.240.0/22,198.41.128.0/17,162.158.0.0/15,104.16.0.0/12,172.64.0.0/13,131.0.72.0/22
+      - --entryPoints.traefik.address=:8080
+      # - --entryPoints.ping.address=:8081
+      - --api=true
+      #- --api.insecure=false
+      #- --api.dashboard=false
+      #- --ping=true
+      #- --pilot.token=$TRAEFIK_PILOT_TOKEN
+      - --serversTransport.insecureSkipVerify=true
+      - --log=true
+      - --log.level=WARN # (Default: error) DEBUG, INFO, WARN, ERROR, FATAL, PANIC
+      - --accessLog=true
+      - --accessLog.filePath=/traefik.log
+      - --accessLog.bufferingSize=100 # Configuring a buffer of 100 lines
+      - --accessLog.filters.statusCodes=400-499
+      - --providers.docker=true
+      # - --providers.docker.endpoint=unix:///var/run/docker.sock # Use Docker Socket Proxy instead for improved security
+      - --providers.docker.endpoint=tcp://socket-proxy:2375
+      # Automatically set Host rule for services
+      # - --providers.docker.defaultrule=Host(`{{ index .Labels "com.docker.compose.service" }}.$DOMAINNAME`)
+      - --providers.docker.exposedByDefault=false
+      # - --entrypoints.https.http.middlewares=chain-oauth@file
+      - --entrypoints.https.http.tls.options=tls-opts@file
+      # Add dns-cloudflare as default certresolver for all services. Also enables TLS and no need to specify on individual services
+      - --entrypoints.https.http.tls.certresolver=dns-cloudflare
+      - --entrypoints.https.http.tls.domains[0].main=$DOMAINNAME
+      - --entrypoints.https.http.tls.domains[0].sans=*.$DOMAINNAME
+      # - --entrypoints.https.http.tls.domains[1].main=$DOMAIN # Pulls main cert for second domain
+      # - --entrypoints.https.http.tls.domains[1].sans=*.$DOMAIN # Pulls wildcard cert for second domain
+      - --providers.docker.network=t2_proxy
+      - --providers.docker.swarmMode=false
+      - --providers.file.directory=/rules # Load dynamic configuration from one or more .toml or .yml files in a directory
+      # - --providers.file.filename=/path/to/file # Load dynamic configuration from a file
+      - --providers.file.watch=true # Only works on top level files in the rules folder
+      # - --certificatesResolvers.dns-cloudflare.acme.caServer=https://acme-staging-v02.api.letsencrypt.org/directory # LetsEncrypt Staging Server - uncomment when testing
+      - --certificatesResolvers.dns-cloudflare.acme.email=$CLOUDFLARE_EMAIL
+      - --certificatesResolvers.dns-cloudflare.acme.storage=/acme.json
+      - --certificatesResolvers.dns-cloudflare.acme.dnsChallenge.provider=cloudflare
+      - --certificatesResolvers.dns-cloudflare.acme.dnsChallenge.resolvers=1.1.1.1:53,1.0.0.1:53
+      - --certificatesResolvers.dns-cloudflare.acme.dnsChallenge.delayBeforeCheck=90 # To delay DNS check and reduce LE hitrate
+    networks:
+      t2_proxy:
+        ipv4_address: 192.168.90.254 # You can specify a static IP
+    # networks:
+    #  - 
+      socket_proxy:
+    ports:
+      - target: 80
+        published: 80
+        protocol: tcp
+        mode: host
+      - target: 443
+        published: 443
+        protocol: tcp
+        mode: host
+      #- target: 8080 # insecure api wont work
+      #  published: 8080
+      #  protocol: tcp
+      #  mode: host
+    volumes:
+      - $DOCKERDIR/traefik/rules:/rules # file provider directory
+      # - /var/run/docker.sock:/var/run/docker.sock:ro # If you use Docker Socket Proxy, comment this line out
+      - $DOCKERDIR/traefik/acme/acme.json:/acme.json # cert location - you must create this empty file and change permissions to 600
+      - $DOCKERDIR/logs/traefik:/logs # for fail2ban or crowdsec
+      - $DOCKERDIR/shared:/shared
+    environment:
+      - TZ=$TZ
+      - CF_API_EMAIL_FILE=/run/secrets/cf_email
+      - CF_API_KEY=$CLOUDFLARE_API_KEY
+      # - CF_API_KEY_FILE=/run/secrets/cf_api_key
+      - DOMAINNAME # Passing the domain name to the traefik container to be able to use the variable in rules.
+    secrets:
+      - cf_email
+      - cf_api_key
+      - htpasswd
+    labels:
+      # homepage
+      - homepage.group=Netwerk
+      - homepage.name=Traefik
+      - homepage.icon=traefik.png
+      - homepage.href=https://treafik.gladsheimr.nl
+      - homepage.description=Proxy management
+      - homepage.widget.type=traefik
+      - homepage.widget.url=http://traefik.gladsheimr.nl
+      - homepage.widget.username=$TRAEFIK_USER # optional
+      - homepage.widget.password=$TRAEFIK_PASS # optional
+      # reverse proxy
+      - "traefik.enable=true"
+      # HTTP-to-HTTPS Redirect
+      - "traefik.http.routers.http-catchall.entrypoints=http"
+      - "traefik.http.routers.http-catchall.rule=HostRegexp(`{host:.+}`)"
+      - "traefik.http.routers.http-catchall.middlewares=redirect-to-https"
+      -  "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+      # HTTP Routers
+      - "traefik.http.routers.traefik-rtr.entrypoints=https"
+      - "traefik.http.routers.traefik-rtr.rule=Host(`traefik.$DOMAINNAME`)"
+      - "traefik.http.routers.traefik-rtr.tls=true" # Some people had 404s without this
+      # - "traefik.http.routers.traefik-rtr.tls.certresolver=dns-cloudflare" # Comment out this line after first run of traefik to force the use of wildcard certs
+      - "traefik.http.routers.traefik-rtr.tls.domains[0].main=$DOMAINNAME"
+      - "traefik.http.routers.traefik-rtr.tls.domains[0].sans=*.$DOMAINNAME"
+      # - "traefik.http.routers.traefik-rtr.tls.domains[1].main=$DOMAINNAME2" # Pulls main cert for second domain
+      # - "traefik.http.routers.traefik-rtr.tls.domains[1].sans=*.$DOMAINNAME2" # Pulls wildcard cert for second domain
+      ## Services - API
+      - "traefik.http.routers.traefik-rtr.service=api@internal"
+      ## Middlewares
+      - "traefik.http.routers.traefik-rtr.middlewares=chain-basic-auth@file"
+
+# Docker Socket Proxy - Security Enchanced Proxy for Docker Socket
+  socket-proxy:
+    <<: *common-keys-core # See EXTENSION FIELDS at the top
+    container_name: socket-proxy
+    image: tecnativa/docker-socket-proxy:latest
+    networks:
+      socket_proxy:
+        ipv4_address: 192.168.91.254 # You can specify a static IP
+    # privileged: true # true for VM. False for unprivileged LXC container.
+    ports:
+      - "127.0.0.1:2375:2375" # Port 2375 should only ever get exposed to the internal network. When possible use this line.
+    # I use the next line instead, as I want portainer to manage multiple docker endpoints within my home network.
+      # - "2375:2375"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    environment:
+      - LOG_LEVEL=info # debug,info,notice,warning,err,crit,alert,emerg
+      ## Variables match the URL prefix (i.e. AUTH blocks access to /auth/* parts of the API, etc.).
+      # 0 to revoke access.
+      # 1 to grant access.
+      ## Granted by Default
+      - EVENTS=1
+      - PING=1
+      - VERSION=1
+      ## Revoked by Default
+      # Security critical
+      - AUTH=0
+      - SECRETS=0
+      - POST=1 # Watchtower
+      # Not always needed
+      - BUILD=0
+      - COMMIT=0
+      - CONFIGS=0
+      - CONTAINERS=1 # Traefik, portainer, etc.
+      - DISTRIBUTION=0
+      - EXEC=0
+      - IMAGES=1 # Portainer
+      - INFO=1 # Portainer
+      - NETWORKS=1 # Portainer
+      - NODES=0
+      - PLUGINS=0
+      - SERVICES=1 # Portainer
+      - SESSION=0
+      - SWARM=0
+      - SYSTEM=0
+      - TASKS=1 # Portainer
+      - VOLUMES=1 # Portainer
+        
+# Authelia (Lite) - Self-Hosted Single Sign-On and Two-Factor Authentication
+  authelia:
+    container_name: authelia
+    image: authelia/authelia:4.37.2
+    # image: authelia/authelia:4.21.0
+    restart: always
+    networks:
+      - t2_proxy
+      - socket_proxy
+      - default
+    #depends_on:
+    #  - mariadb
+    #  - redis
+    volumes:
+      - $DOCKERDIR/authelia:/config
+    environment:
+      - TZ=$TZ
+      - AUTHELIA_JWT_SECRET_FILE=/run/secrets/authelia_jwt_secret
+      - AUTHELIA_SESSION_SECRET_FILE=/run/secrets/authelia_session_secret
+      - AUTHELIA_STORAGE_MYSQL_PASSWORD_FILE=/run/secrets/authelia_storage_mysql_password
+      - AUTHELIA_NOTIFIER_SMTP_PASSWORD_FILE=/run/secrets/authelia_notifier_smtp_password
+      - AUTHELIA_DUO_API_SECRET_KEY_FILE=/run/secrets/authelia_duo_api_secret_key
+    secrets:
+      - authelia_jwt_secret
+      - authelia_session_secret
+      - authelia_storage_mysql_password
+      - authelia_notifier_smtp_password
+      - authelia_duo_api_secret_key
+    labels:
+      # homepage
+      - homepage.group=Utilities
+      - homepage.name=Authelia
+      - homepage.icon=authelia.png
+      - homepage.href=https://authelia.gladsheimr.nl
+      - homepage.description=Authentication management
+      # reverse proxy
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.authelia-rtr.entrypoints=https"
+      - "traefik.http.routers.authelia-rtr.rule=HostHeader(`authelia.$DOMAINNAME`)"
+      - "traefik.http.routers.authelia-rtr.tls=true"
+      ## Middlewares
+      - 'traefik.http.middlewares.authelia.forwardAuth.trustForwardHeader=true'
+      - "traefik.http.routers.authelia-rtr.middlewares=chain-authelia@file"
+      ## HTTP Services
+      - "traefik.http.routers.authelia-rtr.service=authelia-svc"
+      - "traefik.http.services.authelia-svc.loadbalancer.server.port=9091"
+
+# Uptime Kuma - Uptime Kuma is an easy-to-use self-hosted monitoring tool.
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    container_name: uptime-kuma
+    networks:
+      - t2_proxy
+      - socket_proxy
+    volumes:
+      - $DOCKERDIR/uptime-kuma:/app/data
+    ports:
+      - 3001:3001  # <Host Port>:<Container Port>
+    restart: always
+    labels:
+    labels:
+      # homepage
+      - homepage.group=Netwerk
+      - homepage.name=Uptime-Kuma
+      - homepage.icon=uptime-kuma.png
+      - homepage.href=https://uptime.gladsheimr.nl
+      - homepage.description=Uptime management
+      # reverse proxy
+      - "traefik.enable=true"
+      - "traefik.frontend.headers.customFrameOptionsValue=https://organizr.gladsheimr.nl || https://hass.gladsheimr.nl"
+      - "traefik.http.routers.uptime-kuma.entrypoints=https"
+      ## HTTP Routers
+      - "traefik.http.routers.uptime-kuma-rtr.entrypoints=https"
+      - "traefik.http.routers.uptime-kuma.tls=true"
+      - "traefik.http.routers.uptime-kuma-rtr.rule=Host(`uptime.$DOMAINNAME`)"
+      ## Middlewares
+      - "traefik.http.routers.uptime-kuma-rtr.middlewares=chain-authelia@file"
+      ## HTTP Services
+      - "traefik.http.routers.uptime-kuma.tls.certresolver=myresolver"
+      - "traefik.http.services.uptime-kuma.loadBalancer.server.port=3001"
+
+# Organizr - Unified Frontend
+  organizr:
+    <<: *common-keys-core # See EXTENSION FIELDS at the top
+    container_name: organizr
+    image: organizr/organizr
+    # ports:
+    #   - "81:80"
+    volumes:
+      - $DOCKERDIR/organizr:/config
+    environment:
+      - PUID=$PUID
+      - PGID=$PGID
+      - TZ=$TZ
+      - fpm=true #true or false | using true will provide better performance
+      - branch=v2-master #v2-master or #v2-develop
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.organizr.middlewares=authelia@docker"
+      - "traefik.http.routers.organizr-rtr.entrypoints=https"
+      - "traefik.http.routers.organizr-rtr.rule=Host(`$DOMAINNAME`) || Host(`www.$DOMAINNAME`)"
+      ## Middlewares
+      - "traefik.http.routers.organizr-rtr.middlewares=organizr-redirect@docker,chain-authelia@file"
+        # Redirect non-www to www middleware
+      - "traefik.http.middlewares.organizr-redirect.redirectregex.regex=^https?://$DOMAINNAME/(.*)"
+      - "traefik.http.middlewares.organizr-redirect.redirectregex.replacement=https://www.$DOMAINNAME/$${1}"
+      - "traefik.http.middlewares.organizr-redirect.redirectregex.permanent=true"
+      ## HTTP Services
+      - "traefik.http.routers.organizr-rtr.service=organizr-svc"
+      - "traefik.http.services.organizr-svc.loadbalancer.server.port=80"
+
+  homepage:
+    image: ghcr.io/benphelps/homepage:latest
+    container_name: homepage
+    volumes:
+        - $DOCKERDIR/homepage:/app/config
+    ports:
+        - 3000:3000
+    restart: unless-stopped
+    networks:
+      - t2_proxy
+      - socket_proxy
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.homepage-rtr.entrypoints=https"
+      - "traefik.http.routers.homepage-rtr.rule=Host(`homepage.$DOMAINNAME`)"
+      ## Middlewares
+      - "traefik.http.routers.homepage-rtr.middlewares=chain-authelia@file"
+      ## HTTP Services
+      - "traefik.http.routers.homepage-rtr.service=homepage-svc"
+      - "traefik.http.services.homepage-svc.loadbalancer.server.port=3000"
+      
+  homarr:
+    container_name: homarr
+    image: ghcr.io/ajnart/homarr:latest
+    restart: unless-stopped
+    volumes:
+      - $DOCKERDIR/homarr/configs:/app/data/configs
+      - $DOCKERDIR/homarr/icons:/app/public/icons
+    ports:
+      - '7575:7575'
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.homarr-rtr.entrypoints=https"
+      - "traefik.http.routers.homarr-rtr.rule=Host(`homarr.$DOMAINNAME`)"
+      ## Middlewares
+      - "traefik.http.routers.homarr-rtr.middlewares=chain-authelia@file"
+      ## HTTP Services
+      - "traefik.http.routers.homarr-rtr.service=homarr-svc"
+      - "traefik.http.services.homarr-svc.loadbalancer.server.port=7575"
+
+############################# SMART HOME
+
+# Home Assistant Core - Home Automation
+  homeassistant:
+    container_name: homeassistant
+    restart: unless-stopped
+    image: homeassistant/home-assistant:latest
+    network_mode: host
+    privileged: true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - $DOCKERDIR/homeassistant/config:/config
+      - $STORAGE/Slaap_Muziek:/media/Slaap_Muziek
+      - /etc/localtime:/etc/localtime:ro
+      #- ~/.shh:/root/.ssh:ro
+    environment:
+      <<: *default-tz-puid-pgid
+    depends_on: 
+      - mqtt
+      - zigbee2mqtt
+    labels:
+      # homepage
+      - homepage.group=Smart home
+      - homepage.name=Homeassistant
+      - homepage.icon=home-assistant.png
+      - homepage.href=https://hass.gladsheimr.nl
+      - homepage.description=Home management
+      # reverse proxy
+# Mosquitto - MQTT broker
+  mqtt:
+    <<: *common-keys-core # See EXTENSION FIELDS at the top
+    container_name: mqtt
+    image: eclipse-mosquitto:latest
+    volumes:
+      - $DOCKERDIR/mqtt/config:/mosquitto/config
+      - $DOCKERDIR/mqtt/log:/mosquitto/log
+      - $DOCKERDIR/mqtt/data:/mosquitto/data
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - $MQTT:1883
+      # - "9001:9001"   
+    environment:
+      - TZ=$TZ
+
+# Zigee2MQTT - Zigbee bridge to MQTT
+  zigbee2mqtt:
+    <<: *common-keys-core
+    container_name: zigbee2mqtt
+    image: koenkk/zigbee2mqtt
+    volumes:
+      - /$DOCKERDIR/z2m:/app/data
+      - /run/udev:/run/udev:ro
+    # ports:
+    #   - 8585:8080
+    environment:
+      <<: *default-tz-puid-pgid
+    devices:
+      - /dev/ttyACM0:/dev/ttyACM0
+    labels:
+      # homepage
+      - homepage.group=Smart home
+      - homepage.name=Zigee2MQTT
+      - homepage.icon=home-assistant.png
+      - homepage.href=https://zigbee2mqtt.$DOMAINNAME
+      - homepage.description=Zigbee management
+      # reverse proxy
+      - "traefik.enable=true"
+      #- "traefik.frontend.headers.customFrameOptionsValue=https://organizr.gladsheimr.nl"
+      ## HTTP Routers
+      - "traefik.http.routers.zigbee2mqtt-rtr.entrypoints=https"
+      - "traefik.http.routers.zigbee2mqtt-rtr.rule=Host(`zigbee2mqtt.$DOMAINNAME`)"
+      ## Middlewares
+      - "traefik.http.routers.zigbee2mqtt-rtr.middlewares=chain-authelia@file"
+      ## HTTP Services
+      - "traefik.http.routers.zigbee2mqtt-rtr.service=zigbee2mqtt-svc"
+      - "traefik.http.services.zigbee2mqtt-svc.loadbalancer.server.port=8080"
+
+# ESPHome - ESPHome
+  esphome:
+    <<: *common-keys-apps # See EXTENSION FIELDS at the top
+    container_name: esphome
+    image: esphome/esphome
+    # devices:
+    #   - /dev/ttyUSB0:/dev/ttyUSB0
+    environment:
+      - TZ=$TZ
+      - ESPHOME_DASHBOARD_USE_PING=true 
+    # ports:
+      # - 6052:6052
+      # - 6123:6123
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - $DOCKERDIR/esphome:/config
+    labels:
+      # Homepage
+      - homepage.group=Smart home
+      - homepage.name=ESPHome
+      - homepage.icon=esphome.png
+      - homepage.href=https://esphome.$DOMAINNAME
+      - homepage.description=ESP8266/ESP32 Management
+      # reverse proxy
+      - "traefik.enable=true"
+      - "traefik.frontend.headers.customFrameOptionsValue=https://organizr.gladsheimr.nl || https://hass.gladsheimr.nl"
+      ## HTTP Routers
+      - "traefik.http.routers.esphome-rtr.entrypoints=https"
+      - "traefik.http.routers.esphome-rtr.rule=Host(`esphome.$DOMAINNAME`)"
+      ## Middlewares
+      - "traefik.http.routers.esphome-rtr.middlewares=chain-authelia@file"
+      ## HTTP Services
+      - "traefik.http.routers.esphome-rtr.service=esphome-svc"
+      - "traefik.http.services.esphome-svc.loadbalancer.server.port=6052"
+
+# Rhasspy - an open source, fully offline set of voice assistant services for many human languages
+  rhasspy:
+    image: "rhasspy/rhasspy"
+    container_name: rhasspy
+    restart: unless-stopped
+    volumes:
+      - "$DOCKERDIR/rhasspy/profiles:/profiles"
+      - "/etc/localtime:/etc/localtime:ro"
+    networks:
+      - t2_proxy
+    ports:
+      - "12101:12101"
+      - "2333:12333/udp"
+    devices:
+      - "/dev/snd:/dev/snd"
+    command: --user-profiles /profiles --profile nl
+    labels:
+      # homepage
+      - homepage.group=Smart home
+      - homepage.name=Rhasspy
+      - homepage.icon=rhasspy.png
+      - homepage.href=https://rhasspy.$DOMAINNAME
+      - homepage.description=An open source, fully offline set of voice assistant services for many human languages.
+      # reverse proxy
+      - "traefik.enable=true"
+      - "traefik.frontend.headers.customFrameOptionsValue=https://organizr.gladsheimr.nl || https://hass.gladsheimr.nl"
+    ## HTTP Routers
+      - "traefik.http.routers.rhasspy-rtr.entrypoints=https"
+      - "traefik.http.routers.rhasspy-rtr.rule=Host(`rhasspy.$DOMAINNAME`)"
+    ## Middlewares
+      - "traefik.http.routers.rhasspy-rtr.middlewares=chain-authelia@file"
+    ## HTTP Services
+      - "traefik.http.routers.rhasspy-rtr.service=rhasspy-svc"
+      - "traefik.http.services.rhasspy-svc.loadbalancer.server.port=12101"
+
+# ############################# Smarter Shopping
+
+# Grocy - ERP beyond your fridge
+  grocy:
+    image: ghcr.io/linuxserver/grocy
+    <<: *common-keys-apps # See EXTENSION FIELDS at the top
+    container_name: grocy
+    environment:
+      <<: *default-tz-puid-pgid
+    volumes:
+      - $DOCKERDIR/grocy:/config
+    # ports:
+    #   - 9283:80
+    labels:
+      # homepage
+      - homepage.group=Smart home
+      - homepage.name=Grocy
+      - homepage.icon=grocy.png
+      - homepage.href=https://grocy.$DOMAINNAME
+      - homepage.description=ERP beyond your fridge
+      # reverse proxy
+      - "traefik.enable=true"
+      - "traefik.frontend.headers.customFrameOptionsValue=https://organizr.gladsheimr.nl || https://hass.gladsheimr.nl"
+      ## HTTP Routers
+      - "traefik.http.routers.grocy-rtr.entrypoints=https"
+      - "traefik.http.routers.grocy-rtr.rule=Host(`grocy.$DOMAINNAME`)"
+      ## Middlewares
+      - "traefik.http.routers.grocy-rtr.middlewares=chain-authelia@file"
+      ## HTTP Services
+      - "traefik.http.routers.grocy-rtr.service=grocy-svc"
+      - "traefik.http.services.grocy-svc.loadbalancer.server.port=80"
+
+# Barcode Buddy
+  barcodebuddy:
+    image: f0rc3/barcodebuddy-docker:latest
+    <<: *common-keys-apps # See EXTENSION FIELDS at the top
+    container_name: barcodebuddy
+    environment:
+      # <<: *default-tz-puid-pgid
+      - PUID=$PUID
+      - PGID=$PGID
+      - TZ=$TZ
+      - BBUDDY_EXTERNAL_GROCY_URL=grocy
+    volumes:
+      - $DOCKERDIR/barcodebuddy:/config
+    # ports:
+    #   - 9283:80
+    labels:
+      # homepage
+      - homepage.group=Smart home
+      - homepage.name=Barcode Buddy
+      - homepage.icon=grocy.png
+      - homepage.href=https://barcodebuddy.$DOMAINNAME
+      - homepage.description=Barcode Buddy for Grocy
+      # reverse proxy
+      - "traefik.enable=true"
+      - "traefik.frontend.headers.customFrameOptionsValue=https://organizr.gladsheimr.nl || https://hass.gladsheimr.nl"
+      ## HTTP Routers
+      - "traefik.http.routers.barcodebuddy-rtr.entrypoints=https"
+      - "traefik.http.routers.barcodebuddy-rtr.rule=Host(`barcodebuddy.$DOMAINNAME`)"
+      ## Middlewares
+      - "traefik.http.routers.barcodebuddy-rtr.middlewares=chain-authelia@file"
+      ## HTTP Services
+      - "traefik.http.routers.barcodebuddy-rtr.service=barcodebuddy-svc"
+      - "traefik.http.services.barcodebuddy-svc.loadbalancer.server.port=80"
+
+# docker run -d -v bbconfig:/config -p 8080:80 -p 9443:443 f0rc3/barcodebuddy-docker:latest
+############################# DATABASE
+# MariaDB - MySQL Database
+  # After starting container for first time dexec and mysqladmin -u root password <password>
+  mariadb:
+    <<: *common-keys-core # See EXTENSION FIELDS at the top
+    container_name: mariadb
+    image: linuxserver/mariadb:latest
+    ports:
+      - $MARIADB:3306
+    volumes:
+      - $DOCKERDIR/mariadb/data:/config
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - PUID=$PUID
+      - PGID=$PGID
+      - TZ=$TZ
+      # - MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD # Not taking this pw during initialization
+      - MYSQL_ROOT_PASSWORD_FILE=/run/secrets/mysql_root_password # Not taking this pw during initialization
+    secrets:
+      - mysql_root_password
+
+# phpMyAdmin - Bringing MySQL to the web - Database management
+  # Create a new user with admin privileges. Cannot login as MySQL root for some reason.
+  phpmyadmin:
+    <<: *common-keys-apps # See EXTENSION FIELDS at the top
+    image: phpmyadmin/phpmyadmin:latest
+    container_name: phpmyadmin
+    depends_on:
+      - mariadb
+    # volumes:
+    #   - $DOCKERDIR/phpmyadmin:/etc/phpmyadmin
+    environment:
+      - PMA_HOST=mariadb
+      - PMA_PORT=$MARIADB
+      #- PMA_ARBITRARY=1
+      - MYSQL_ROOT_PASSWORD_FILE=/run/secrets/mysql_root_password
+    secrets:
+      - mysql_root_password
+    labels:
+      # homepage
+      - homepage.group=Utilities
+      - homepage.name=PHPMyAdmin
+      - homepage.icon=phpmyadmin.png
+      - homepage.href=https://pma.$DOMAINNAME
+      - homepage.description=Bringing MySQL to the web
+      # reverse proxy
+      - "traefik.enable=true"
+      - "traefik.frontend.headers.customFrameOptionsValue=https://organizr.gladsheimr.nl"
+      ## HTTP Routers
+      - "traefik.http.routers.phpmyadmin-rtr.entrypoints=https"
+      - "traefik.http.routers.phpmyadmin-rtr.rule=Host(`pma.$DOMAINNAME`)"
+      ## Middlewares
+      - "traefik.http.routers.phpmyadmin-rtr.middlewares=chain-authelia@file"
+      ## HTTP Services
+      - "traefik.http.routers.phpmyadmin-rtr.service=phpmyadmin-svc"
+      - "traefik.http.services.phpmyadmin-svc.loadbalancer.server.port=80"
+
+# Redis - Key-value Store
+  redis:
+    <<: *common-keys-apps # See EXTENSION FIELDS at the top
+    restart: always
+    container_name: redis
+    image: redis:5.0-alpine
+    ports:
+      - $REDIS:6379
+    command:
+      - redis-server
+      - --appendonly
+      - "no"
+      - --databases
+      - "2"
+      - --maxmemory
+      - "100mb"
+      - --maxclients
+      - "500"
+      - --maxmemory-policy
+      - "allkeys-lru"
+      - --save
+      - ""
+      - --tcp-backlog
+      - "256"
+      - --requirepass
+      - "$$(cat $$REDIS_PASS_FILE)"
+    volumes:
+      - $DOCKERDIR/redis/data:/data
+      - /etc/TZ:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    secrets:
+      - redis_password
+    environment:
+        REDIS_PASS_FILE: /run/secrets/redis_password
+
+# # InfluxDB - Database for sensor data
+  #   # Create influxdb.conf
+  #   influxdb:
+  #     <<: *common-keys-apps # See EXTENSION FIELDS at the top
+  #     image: influxdb:latest
+  #     container_name: influxdb
+  #     ports:
+  #       - "8086:8086"
+  #     volumes:
+  #       # - $DOCKERDIR/influxdb/influxdb.conf:/etc/influxdb/influxdb.conf:ro
+  #       - $DOCKERDIR/influxdb/db:/var/lib/influxdb
+  #   #    command: -config /etc/influxdb/influxdb.conf
+
+# Guacamole - Remote desktop, SSH, on Telnet on any HTML5 Browser 
+ # Create all databases and tables first
+  guacamole:
+    <<: *common-keys-apps # See EXTENSION FIELDS at the top
+    image: guacamole/guacamole:latest
+    container_name: guacamole
+    depends_on:
+      - mariadb
+      - guacd
+    # ports:
+    #   - "$GUACAMOLE_PORT:8080"
+    environment:
+      GUACD_HOSTNAME: guacd
+      MYSQL_HOSTNAME: mariadb
+      MYSQL_PORT: $MARIADB
+      MYSQL_DATABASE_FILE: /run/secrets/guac_db_name
+      MYSQL_USER_FILE: /run/secrets/guac_mysql_user
+      MYSQL_PASSWORD_FILE: /run/secrets/guac_mysql_password
+    secrets:
+      - guac_db_name
+      - guac_mysql_user
+      - guac_mysql_password
+    labels:
+      # homepage
+      - homepage.group=Utilities
+      - homepage.name=Guacamole
+      - homepage.icon=guacamole.png
+      - homepage.href=https://guacamole.$DOMAINNAME
+      - homepage.description=Remote desktop gateway
+      # reverse proxy
+      - "traefik.enable=true"
+      - "traefik.frontend.headers.customFrameOptionsValue=https://organizr.gladsheimr.nl"
+      ## HTTP Routers
+      - "traefik.http.routers.guacamole-rtr.entrypoints=https"
+      - "traefik.http.routers.guacamole-rtr.rule=Host(`guac.$DOMAINNAME`)"
+      - "traefik.http.routers.guacamole-rtr.tls=true"
+      ## Middlewares
+      - "traefik.http.routers.guacamole-rtr.middlewares=chain-authelia@file,add-guacamole" 
+      - "traefik.http.middlewares.add-guacamole.addPrefix.prefix=/guacamole"
+      ## HTTP Services
+      - "traefik.http.routers.guacamole-rtr.service=guacamole-svc"
+      - "traefik.http.services.guacamole-svc.loadbalancer.server.port=8080"
+
+# Guacamole Daemon - Needed for Guacamole
+  guacd:
+    image: guacamole/guacd
+    container_name: guacd
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - t2_proxy
+
+############################# DOWNLOADERS
+
+# # TransmissionBT - Torrent Downloader
+  # # ONLY ACCESSIBLE THROUGH https://domain.com/transmission/web/ if using PathPrefix
+  # transmission:
+  #   <<: *common-keys-apps # See EXTENSION FIELDS at the top
+  #   image: ghcr.io/linuxserver/transmission
+  #   container_name: transmission
+  #   restart: always
+  #   networks:
+  #     # - t2_proxy
+  #     t2_proxy:
+  #       # ipv4_address: 192.168.90.90
+  #   # security_opt:
+  #   #   - no-new-privileges:true
+  #   ports:
+  #     - "9091:9091"
+  #   cap_add:
+  #     - NET_ADMIN
+  #   volumes:
+  #     - /etc/localtime:/etc/localtime:ro
+  #     - $DOCKERDIR/transmission/data:/data
+  #     - $DOCKERDIR/transmission/config:/config
+  #     - $DOWNLOADSDIR:/downloads
+  #     - $DOWNLOADSDIR/Watch:/watch
+  #   environment:
+  #     PUID: $PUID
+  #     PGID: $PGID
+  #     TZ: $TZ
+  #     FILE_USER: /run/secrets/transmission_user
+  #     FILE_PASS: /run/secrets/transmission_password
+  #     TRANSMISSION_WATCH_DIR: /watch
+  #     TRANSMISSION_WATCH_DIR_ENABLED: "true"
+  #     TRANSMISSION_WEB_HOME: /combustion-release/ #optional
+  #   labels:
+  #     - "traefik.enable=true"
+  #     ## HTTP Routers
+  #     - "traefik.http.routers.transmission-rtr.entrypoints=https"
+  #     - "traefik.http.routers.transmission-rtr.rule=Host(`transmission.$DOMAINNAME`)"
+  #     ## Middlewares
+  #     - "traefik.http.routers.transmission-rtr.middlewares=chain-authelia@file"
+  #     ## HTTP Services
+  #     - "traefik.http.routers.transmission-rtr.service=transmission-svc"
+  #     - "traefik.http.services.transmission-svc.loadbalancer.server.port=9091"
+  #   secrets:
+  #     - transmission_user
+  #     - transmission_password
+  #   # environment:
+  #   #     TRANSMISSION_USER_FILE: /run/secrets/transmission_user
+  #   #     TRANSMISSION_PASS_FILE: /run/secrets/transmission_password
+
+# SABnzbd - The free and easy binary newsreader
+  # Disable SABnzbd's built-in HTTPS support for traefik proxy to work
+  # Needs trailing / if using PathPrefix
+  sabnzbd:
+    <<: *common-keys-apps # See EXTENSION FIELDS at the top
+    image: linuxserver/sabnzbd:latest
+    container_name: sabnzbd
+    ports:
+      - "8181:8080"
+    volumes:
+      - $DOCKERDIR/sabnzbd:/config
+      - $DOWNLOADSDIR:/downloads
+      - $DOWNLOADSDIR/incomplete:/incomplete-downloads
+    environment:
+      PUID: $PUID
+      PGID: $PGID
+      TZ: $TZ
+      UMASK_SET: 002
+    labels:
+      # homepage
+      - homepage.group=Documents & Files
+      - homepage.name=SABnzbd
+      - homepage.icon=sabnzbd.png
+      - homepage.href=https://sabnzbd.$DOMAINNAME
+      - homepage.description=Binary newsreader
+      - homepage.widget.type=sabnzbd
+      - homepage.widget.url=http://sabnzbd.gladsheimr.nl
+      - homepage.widget.key=$SABNZBD_API_KEY
+      # reverse proxy
+    #   - "traefik.enable=true"
+    #   - "traefik.frontend.headers.customFrameOptionsValue=https://organizr.gladsheimr.nl"
+    #   ## HTTP Routers Auth Bypass
+    #   - "traefik.http.routers.sabnzbd-rtr-bypass.entrypoints=https"
+    #   - "traefik.http.routers.sabnzbd-rtr-bypass.rule=Host(`sabnzbd.$DOMAINNAME`) && Query(`apikey`, `$SABNZBD_API_KEY`) || Query(`apikey`, `$SABNZBD_NZB_KEY`)"
+    #   - "traefik.http.routers.sabnzbd-rtr-bypass.priority=100"
+    #   ## HTTP Routers Auth
+    #   - "traefik.http.routers.sabnzbd-rtr.tls=true"
+
+    #   - "traefik.http.routers.sabnzbd-rtr.entrypoints=https"
+    #   - "traefik.http.routers.sabnzbd-rtr.rule=Host(`sabnzbd.$DOMAINNAME`)"
+    #   - "traefik.http.routers.sabnzbd-rtr.priority=99"
+    #   ## Middlewares
+    #   - "traefik.http.routers.sabnzbd-rtr-bypass.middlewares=chain-no-auth@file"
+    #   - "traefik.http.routers.sabnzbd-rtr.middlewares=chain-authelia@file"
+    #   ## HTTP Services
+    #   - "traefik.http.routers.sabnzbd-rtr-bypass.service=sabnzbd-svc"
+    #   - "traefik.http.routers.sabnzbd-rtr.service=sabnzbd-svc"
+
+    #   - "traefik.http.services.sabnzbd-svc.loadbalancer.server.port=8080"
+
+############################# MEDIA FILE MANAGEMENT
+
+# Prowlarr - An indexer manager/proxy built on the popular *arr .net/reactjs base stack to integrate with your various PVR apps.
+  prowlarr:
+    <<: *common-keys-apps # See EXTENSION FIELDS at the top
+    image: ghcr.io/linuxserver/prowlarr:develop
+    container_name: prowlarr
+    networks:
+      t2_proxy:
+        ipv4_address: 192.168.90.162
+    # ports:
+    #  - "9696:9696"
+    volumes:
+      - $DOCKERDIR/prowlarr:/config
+      - "/etc/localtime:/etc/localtime:ro"
+    environment:
+      <<: *default-tz-puid-pgid
+    labels:
+      # homepage
+      - homepage.group=Media
+      - homepage.name=Prowlarr
+      - homepage.icon=prowlarr.png
+      - homepage.href=https://prowlarr.$DOMAINNAME
+      - homepage.description=Indexer management
+      - homepage.weight=3
+      # reverse proxy
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.prowlarr-rtr.entrypoints=https"
+      - "traefik.http.routers.prowlarr-rtr.rule=Host(`prowlarr.$DOMAINNAME`)"
+      ## Middlewares
+      - "traefik.http.routers.sabnzbd-rtr.middlewares=chain-authelia@file"
+      ## HTTP Services
+      - "traefik.http.routers.prowlarr-rtr.service=prowlarr-svc"
+      - "traefik.http.services.prowlarr-svc.loadbalancer.server.port=9696"
+
+# Bazarr - A companion application to Sonarr and Radarr that manages and downloads subtitles based on your requirements.
+  bazarr:
+    <<: *common-keys-apps # See EXTENSION FIELDS at the top
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: bazarr
+    ports:
+      - "6767:6767"
+    volumes:
+      - $DOCKERDIR/bazarr:/config
+      - $STORAGE/Series:/series
+      - $STORAGE/Films:/movies
+    environment:
+      # <<: *default-tz-puid-pgid
+      TZ: "Europe/Amsterdam"
+      PUID: $PUID
+      PGID: $PGID
+    labels:
+      # homepage
+      - homepage.group=Media
+      - homepage.name=Bazarr
+      - homepage.icon=bazarr.png
+      - homepage.href=https://bazarr.$DOMAINNAME
+      - homepage.description=Subtitle managment
+      - homepage.widget.type=bazarr
+      - homepage.widget.url=https://bazarr.gladsheimr.nl
+      - homepage.widget.key=$BAZARR_API_KEY
+      - homepage.weight=8
+      # reverse proxy
+      - "traefik.enable=true"
+      - "traefik.frontend.headers.customFrameOptionsValue=https://organizr.gladsheimr.nl"
+      ## HTTP Routers
+      - "traefik.http.routers.bazarr-rtr.entrypoints=https"
+      - "traefik.http.routers.bazarr-rtr.rule=Host(`bazarr.$DOMAINNAME`)"
+      ## Middlewares
+      - "traefik.http.routers.bazarr-rtr.middlewares=chain-authelia@file"
+      ## HTTP Services
+      - "traefik.http.routers.bazarr-rtr.service=bazarr-svc"
+      - "traefik.http.services.bazarr-svc.loadbalancer.server.port=6767"
+
+# NZBHydra2 - NZBHydra 2 is a meta search for newznab indexers and torznab trackers
+  hydra:
+    <<: *common-keys-apps # See EXTENSION FIELDS at the top
+    image: ghcr.io/linuxserver/nzbhydra2:latest
+    container_name: hydra
+    # ports:
+    #   - "5076:5076"
+    volumes:
+      - $DOCKERDIR/hydra2:/config
+      - $USERDIR:/downloads
+    environment:
+      <<: *default-tz-puid-pgid
+    labels:
+      # homepage
+      - homepage.group=Media
+      - homepage.name=NZBHydra2
+      - homepage.icon=nzbhydra.png
+      - homepage.href=https://hydra.$DOMAINNAME
+      - homepage.description=NZB managment
+      - homepage.weight=4
+      # reverse proxy
+      - "traefik.enable=true"
+      - "traefik.frontend.passHostHeader: true"
+      ## HTTP Routers Auth Bypass
+      - "traefik.http.routers.hydra-rtr-bypass.entrypoints=https"
+      - "traefik.http.routers.hydra-rtr-bypass.rule=Host(`hydra.$DOMAINNAME`) && (Headers(`X-Api-Key`, `$HYDRA_API_KEY`) || Query(`apikey`, `$HYDRA_API_KEY`))"
+      - "traefik.http.routers.hydra-rtr-bypass.priority=100"
+      ## HTTP Routers
+      - "traefik.http.routers.hydra-rtr.entrypoints=https"
+      - "traefik.http.routers.hydra-rtr.rule=Host(`hydra.$DOMAINNAME`)"
+      ## Middlewares
+      - "traefik.http.routers.hydra-rtr.middlewares=chain-authelia@file"
+      ## HTTP Services
+      - "traefik.http.routers.hydra-rtr.service=hydra-svc"
+      - "traefik.http.services.hydra-svc.loadbalancer.server.port=5076"
+
+############################# PVRS
+
+# Beets - Music Library Manager
+  # beets:
+  #   <<: *common-keys-apps # See EXTENSION FIELDS at the top
+  #   image: ghcr.io/linuxserver/beets
+  #   container_name: beets
+  #   environment:
+  #     <<: *default-tz-puid-pgid
+  #   ports:
+  #     - 8337:8337
+  #   volumes:
+  #     - $DOCKERDIR/beets:/config
+  #     - $STORAGE/Muziek:/music
+  #     - $DOWNLOADSDIR:/downloads
+
+# Lidarr - A music collection manager for Usenet and BitTorrent users.
+  # Set url_base in lidarr settings if using PathPrefix
+  lidarr:
+    <<: *common-keys-apps # See EXTENSION FIELDS at the top
+    image: ghcr.io/linuxserver/lidarr:latest
+    container_name: lidarr
+    # ports:
+    #   - "8686:8686"
+    volumes:
+      - $DOCKERDIR/lidarr:/config
+      - $DOWNLOADSDIR:/downloads
+      - $STORAGE/Muziek:/music
+      - "/etc/localtime:/etc/localtime:ro"
+    environment:
+      <<: *default-tz-puid-pgid
+    labels:
+      # homepage
+      - homepage.group=Media
+      - homepage.name=Lidarr
+      - homepage.icon=lidarr.png
+      - homepage.href=https://lidarr.$DOMAINNAME
+      - homepage.description=Music managment
+      - homepage.widget.type=lidarr
+      - homepage.widget.url=https://lidarr.gladsheimr.nl
+      - homepage.widget.key=$LIDARR_API_KEY
+      - homepage.weight=7
+      # reverse proxy
+      - "traefik.enable=true"
+      - "traefik.frontend.headers.customFrameOptionsValue=https://organizr.gladsheimr.nl"
+      ## HTTP Routers Auth Bypass
+      - "traefik.http.routers.lidarr-rtr-bypass.entrypoints=https"
+      - "traefik.http.routers.lidarr-rtr-bypass.rule=Host(`lidarr.$DOMAINNAME`) && (Headers(`X-Api-Key`, `$LIDARR_API_KEY`) || Query(`apikey`, `$LIDARR_API_KEY`))"
+      - "traefik.http.routers.lidarr-rtr-bypass.priority=100"
+      ## HTTP Routers Auth
+      - "traefik.http.routers.lidarr-rtr.entrypoints=https"
+      - "traefik.http.routers.lidarr-rtr.rule=Host(`lidarr.$DOMAINNAME`)"
+      - "traefik.http.routers.lidarr-rtr.priority=99"
+      ## Middlewares
+      - "traefik.http.routers.lidarr-rtr-bypass.middlewares=chain-no-auth@file"
+      - "traefik.http.routers.lidarr-rtr.middlewares=chain-authelia@file"
+      ## HTTP Services
+      - "traefik.http.routers.lidarr-rtr.service=lidarr-svc"
+      - "traefik.http.routers.lidarr-rtr-bypass.service=lidarr-svc"
+      - "traefik.http.services.lidarr-svc.loadbalancer.server.port=8686"
+
+# Radarr - A movie collection manager for Usenet and BitTorrent users.
+  # Set url_base in radarr settings if using PathPrefix
+  radarr:
+    <<: *common-keys-apps # See EXTENSION FIELDS at the top
+    # image: aront/radarr #for mp4_automator support
+    image: ghcr.io/linuxserver/radarr
+    container_name: radarr
+    # ports:
+    #   - "7878:7878"
+    volumes:
+      - $DOCKERDIR/radarr:/config
+      - $DOWNLOADSDIR:/downloads
+      - $STORAGE/Films:/movies
+      # - $DOCKERDIR/shared/mp4_automator:/config_mp4_automator
+      - "/etc/localtime:/etc/localtime:ro"
+    environment:
+      <<: *default-tz-puid-pgid
+    labels:
+      # homepage
+      - homepage.group=Media
+      - homepage.name=Radarr
+      - homepage.icon=radarr.png
+      - homepage.href=https://radarr.$DOMAINNAME
+      - homepage.description=Movie managment
+      - homepage.widget.type=radarr
+      - homepage.widget.url=https://radarr.gladsheimr.nl
+      - homepage.widget.key=$RADARR_API_KEY
+      - homepage.weight=6
+      # reverse proxy
+      - "traefik.enable=true"
+      - "traefik.frontend.headers.customFrameOptionsValue=https://organizr.gladsheimr.nl"
+      ## HTTP Routers Auth Bypass
+      - "traefik.http.routers.radarr-rtr-bypass.entrypoints=https"
+      - "traefik.http.routers.radarr-rtr-bypass.rule=Host(`radarr.$DOMAINNAME`) && (Headers(`X-Api-Key`, `$RADARR_API_KEY`) || Query(`apikey`, `$RADARR_API_KEY`))"
+      - "traefik.http.routers.radarr-rtr-bypass.priority=100"
+      ## HTTP Routers Auth
+      - "traefik.http.routers.radarr-rtr.entrypoints=https"
+      - "traefik.http.routers.radarr-rtr.rule=Host(`radarr.$DOMAINNAME`)"
+      - "traefik.http.routers.radarr-rtr.priority=99"
+      ## Middlewares
+      - "traefik.http.routers.radarr-rtr-bypass.middlewares=chain-no-auth@file"
+      - "traefik.http.routers.radarr-rtr.middlewares=chain-authelia@file"
+      ## HTTP Services
+      - "traefik.http.routers.radarr-rtr.service=radarr-svc"
+      - "traefik.http.routers.radarr-rtr-bypass.service=radarr-svc"
+      - "traefik.http.services.radarr-svc.loadbalancer.server.port=7878"
+
+# Sonarr - A PVR for Usenet and BitTorrent users.
+  # Set url_base in sonarr settings if using PathPrefix
+  sonarr:
+    # image: aront/sonarr  #for mp4_automator support
+    <<: *common-keys-apps # See EXTENSION FIELDS at the top
+    image: ghcr.io/linuxserver/sonarr
+    container_name: sonarr
+    # ports:
+    #   - "8989:8989"
+    volumes:
+      - $DOCKERDIR/sonarr:/config
+      - $DOWNLOADSDIR:/downloads
+      - $STORAGE/Series:/series
+      - "/etc/localtime:/etc/localtime:ro"
+    #   - "$DOCKERDIR/shared/mp4_automator:/config_mp4_automator:rw"
+    environment:
+      <<: *default-tz-puid-pgid
+    labels:
+      # homepage
+      - homepage.group=Media
+      - homepage.name=Sonarr
+      - homepage.icon=sonarr.png
+      - homepage.href=https://sonarr.$DOMAINNAME
+      - homepage.description=Series managment
+      - homepage.widget.type=sonarr
+      - homepage.widget.url=https://sonarr.gladsheimr.nl
+      - homepage.widget.key=$SONARR_API_KEY
+      - homepage.weight=5
+      # reverse proxy
+      - "traefik.enable=true"
+      - "traefik.frontend.headers.customFrameOptionsValue=https://organizr.gladsheimr.nl"
+      ## HTTP Routers Auth Bypass
+      - "traefik.http.routers.sonarr-rtr-bypass.entrypoints=https"
+      - "traefik.http.routers.sonarr-rtr-bypass.rule=Host(`sonarr.$DOMAINNAME`) && (Headers(`X-Api-Key`, `$SONARR_API_KEY`) || Query(`apikey`, `$SONARR_API_KEY`))"
+      - "traefik.http.routers.sonarr-rtr-bypass.priority=100"
+      ## HTTP Routers Auth
+      - "traefik.http.routers.sonarr-rtr.entrypoints=https"
+      - "traefik.http.routers.sonarr-rtr.rule=Host(`sonarr.$DOMAINNAME`)"
+      - "traefik.http.routers.sonarr-rtr.priority=99"
+      ## Middlewares
+      - "traefik.http.routers.sonarr-rtr-bypass.middlewares=chain-no-auth@file"
+      - "traefik.http.routers.sonarr-rtr.middlewares=chain-authelia@file"
+      ## HTTP Services
+      - "traefik.http.routers.sonarr-rtr.service=sonarr-svc"
+      - "traefik.http.routers.sonarr-rtr-bypass.service=sonarr-svc"
+      - "traefik.http.services.sonarr-svc.loadbalancer.server.port=8989"
+
+############################# MEDIA
+
+# Jellyfin - The Free Software Media System
+  jellyfin:
+    <<: *common-keys-apps # See EXTENSION FIELDS at the top
+    image: jellyfin/jellyfin:latest
+    container_name: jellyfin
+    devices:
+      - /dev/dri:/dev/dri # for harware transcoding
+    ports:
+      # - 8096:8096
+      # - 8920:8920
+      - 7359:7359/udp #optional
+      - 1901:1900/udp #optional
+    environment:
+      PUID: $PUID
+      PGID: $PGID
+      TZ: $TZ
+      UMASK_SET: 022
+    volumes:
+      - $DOCKERDIR/jellyfin:/config
+      - $STORAGE/Muziek:/data/music
+      - $STORAGE/Series:/data/tvshows
+      - $STORAGE/Films:/data/movies
+      - /opt/vc/lib:/opt/vc/lib #optional
+    labels:
+      # homepage
+      - homepage.group=Media
+      - homepage.name=Jellyfin
+      - homepage.icon=jellyfin.png
+      - homepage.href=https://Jellyfin.$DOMAINNAME
+      - homepage.description=Media server
+      - homepage.widget.type=jellyfin
+      - homepage.widget.url=http://jellyfin.gladsheimr.nl
+      - homepage.widget.key=$JELLYFIN_API_KEY
+      - homepage.weight=1
+      # reverse proxy
+      - "traefik.enable=true"
+      - "traefik.frontend.headers.customFrameOptionsValue=https://organizr.gladsheimr.nl"
+      ## HTTP Routers
+      - "traefik.http.routers.jellyfin-rtr.entrypoints=https"
+      - "traefik.http.routers.jellyfin-rtr.rule=Host(`jellyfin.$DOMAINNAME`)"
+      ## Middlewares
+      - "traefik.http.routers.jellyfin-rtr.middlewares=chain-no-auth@file"
+      ## HTTP Services
+      - "traefik.http.routers.jellyfin-rtr.service=jellyfin-svc"
+      - "traefik.http.services.jellyfin-svc.loadbalancer.server.port=8096"
+
+  jellyseerr:
+    <<: *common-keys-apps # See EXTENSION FIELDS at the top
+    image: fallenbagel/jellyseerr:latest
+    container_name: jellyseerr
+    environment:
+      PUID: $PUID
+      PGID: $PGID
+      TZ: $TZ
+    # ports:
+    #     - 5055:5055
+    volumes:
+        - $DOCKERDIR/jellyseerr/config:/app/config
+    labels:
+      # homepage
+      - homepage.group=Media
+      - homepage.name=jellyseerr
+      - homepage.icon=jellyseerr.png
+      - homepage.href=https://jellyseerr.$DOMAINNAME
+      - homepage.description=managing requests for your media
+      - homepage.widget.type=jellyseerr
+      - homepage.widget.url=https://jellyseerr.gladsheimr.nl
+      - homepage.widget.key=$JELLYSEERR_API_KEY
+      - homepage.weight=2
+      # reverse proxy
+      - "traefik.enable=true"
+      - "traefik.frontend.headers.customFrameOptionsValue=https://organizr.gladsheimr.nl"
+      ## HTTP Routers
+      - "traefik.http.routers.jellyseerr-rtr.entrypoints=https"
+      - "traefik.http.routers.jellyseerr-rtr.rule=Host(`jellyseerr.$DOMAINNAME`)"
+      ## Middlewares
+      - "traefik.http.routers.jellyseerr-rtr.middlewares=chain-no-auth@file"
+      ## HTTP Services
+      - "traefik.http.routers.jellyseerr-rtr.service=jellyseerr-svc"
+      - "traefik.http.services.jellyseerr-svc.loadbalancer.server.port=5055"
+
+# # Ombi - Gives your shared Plex or Emby users the ability to request content by themselves.
+#   ombi:
+#     <<: *common-keys-apps # See EXTENSION FIELDS at the top
+#     image: linuxserver/ombi:latest
+#     container_name: ombi
+#     # ports:
+#     #   - "3579:3579"
+#     volumes:
+#       - $DOCKERDIR/ombi:/config
+#     environment:
+#       PUID: $PUID
+#       PGID: $PGID
+#       TZ: $TZ
+#       BASE_URL: /ombi #optional
+#     labels:
+#       # homepage
+#       - homepage.group=Media
+#       - homepage.name=Ombi
+#       - homepage.icon=ombi.png
+#       - homepage.href=https://ombi.$DOMAINNAME
+#       - homepage.description=Gives your shared Plex or Emby users the ability to request content by themselves.
+#       - homepage.widget.type=ombi
+#       - homepage.widget.url=http://ombi.gladsheimr.nl
+#       - homepage.widget.key=$OMBI_API_KEY
+#       - homepage.weight=7
+#       # reverse proxy
+#       - "traefik.enable=true"
+#       - "traefik.frontend.headers.customFrameOptionsValue=https://organizr.gladsheimr.nl"
+#       ## HTTP Routers
+#       - "traefik.http.routers.ombi-rtr.entrypoints=https"
+#       - "traefik.http.routers.ombi-rtr.rule=Host(`ombi.$DOMAINNAME`)"
+#       ## Middlewares
+#       - "traefik.http.routers.ombi-rtr.middlewares=chain-no-auth@file"
+#       ## HTTP Services
+#       - "traefik.http.routers.ombi-rtr.service=ombi-svc"
+#       - "traefik.http.services.ombi-svc.loadbalancer.server.port=3579"
+
+############################# UTILITIES
+
+# Duplicati - Free backup software to store encrypted backups online
+  duplicati:
+    <<: *common-keys-core # See EXTENSION FIELDS at the top
+    image: lscr.io/linuxserver/duplicati:latest
+    container_name: duplicati
+    # ports:
+    #  - "$DUPLICATI_PORT:8200"
+    volumes:
+      - $DOCKERDIR/duplicati:/config
+      - $STORAGE:/opslag
+      - $USERDIR:/home
+    environment:
+      PUID: 0
+      PGID: 0
+      TZ: $TZ
+      # CLI_ARGS: #optional
+    labels:
+      # homepage
+      - homepage.group=Documents & Files
+      - homepage.name=Duplicati
+      - homepage.icon=duplicati.png
+      - homepage.href=https://duplicati.$DOMAINNAME
+      - homepage.description=Free backup software
+      # reverse proxy
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.duplicati-rtr.entrypoints=https"
+      - "traefik.http.routers.duplicati-rtr.rule=Host(`duplicati.$DOMAINNAME`)"
+      ## Middlewares
+      - "traefik.http.routers.duplicati-rtr.middlewares=chain-authelia@file"
+      ## HTTP Services
+      - "traefik.http.routers.duplicati-rtr.service=duplicati-svc"
+      - "traefik.http.services.duplicati-svc.loadbalancer.server.port=8200"
+
+# VSCode - Code editing. Redefined.
+  vscode:
+    <<: *common-keys-core # See EXTENSION FIELDS at the top
+    image: ghcr.io/linuxserver/code-server:latest
+    container_name: vscode
+    ports:
+      - $VSCODE:8443
+    volumes:
+      # - $USERDIR/openmailbox:/config/workspace/openmailbox
+      # - $USERDIR/Marlin:/config/workspace/Marlin
+      - $DOCKERDIR:/config/workspace/docker
+      # - $DOCKERDIR/homeassistant:/config/workspace/homeassistant
+      # - $DOWNLOADSDIR:/config/workspace/Downloads
+      - $DOCKERDIR/vscode/config:/config
+      # - /media/sdocker:/home/coder/sdocker
+    environment:
+      <<: *default-tz-puid-pgid
+    labels:
+      # homepage
+      - homepage.group=Documents & Files
+      - homepage.name=VSCode
+      - homepage.icon=vscode.png
+      - homepage.href=https://vscode.$DOMAINNAME
+      - homepage.description=Code editing.
+      # reverse proxy
+      - "traefik.enable=true"
+      - "traefik.frontend.headers.customFrameOptionsValue=https://organizr.gladsheimr.nl"
+      ## HTTP Routers
+      - "traefik.http.routers.vscode-rtr.entrypoints=https"
+      - "traefik.http.routers.vscode-rtr.rule=Host(`vscode.$DOMAINNAME`)"
+      - "traefik.http.routers.code-server-rtr.tls=true"
+      ## Middlewares
+      - "traefik.http.middlewares.vscode-stripprefix.stripprefix.prefixes=/vscode"
+      - "traefik.http.routers.vscode-rtr.middlewares=chain-authelia@file"
+      ## HTTP Services
+      - "traefik.http.routers.vscode-rtr.service=vscode-svc"
+      - "traefik.http.services.vscode-svc.loadbalancer.server.port=8443"
+
+# Paperless-ngx - Paperless-ngx is a document management system that transforms your physical documents into a searchable online archive so you can keep, well, less paper.
+  paperless:
+    <<: *common-keys-core # See EXTENSION FIELDS at the top
+    image: ghcr.io/paperless-ngx/paperless-ngx:latest
+    container_name: paperless
+    volumes:
+      - $DOCKERDIR/paperless:/usr/src/paperless/data
+      # - $DOCKERDIR/paperless/opt:/opt/paperless
+      - $STORAGE/paperless:/usr/src/paperless/media
+      - ./export:/usr/src/paperless/export
+      - /volume1/Scan/import:/usr/src/paperless/consume
+    # ports:
+    #   - $PAPERLESS:8000
+    depends_on:
+      - mariadb
+      - redis
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    environment:
+      REDIS_PASS_FILE: /run/secrets/redis_password
+      PAPERLESS_REDIS: redis://redis>:$$(cat $$REDIS_PASS_FILE)@redis:6379
+      PAPERLESS_DBENGINE: mariadb
+      PAPERLESS_DBHOST: mariadb
+      PAPERLESS_DBUSER_FILE: /run/secrets/paperless_mysql_user # only needed if non-default username
+      PAPERLESS_DBPASS_FILE: /run/secrets/paperless_mysql_password # only needed if non-default password
+      PAPERLESS_DBPORT: $MARIADB
+      PAPERLESS_URL: https://paperless.gladsheimr.nl
+    secrets:
+      - redis_password
+      - paperless_mysql_user
+      - paperless_mysql_password
+    labels:
+      # homepage
+      - homepage.group=Documents & Files
+      - homepage.name=Paperless
+      - homepage.icon=paperless.png
+      - homepage.href=https://paperless.$DOMAINNAME
+      - homepage.description=Document management system
+      - homepage.widget.type=paperlessngx
+      - homepage.widget.url=https://paperless.gladsheimr.nl
+      - homepage.widget.username=$PAPERLESS_USER
+      - homepage.widget.password=$PAPERLESS_PASS
+      # reverse proxy
+      - "traefik.enable=true"
+      #- "traefik.frontend.headers.customFrameOptionsValue=https://organizr.gladsheimr.nl"
+      ## HTTP Routers
+      - "traefik.http.routers.paperless-rtr.entrypoints=https"
+      - "traefik.http.routers.paperless-rtr.rule=Host(`paperless.$DOMAINNAME`)"
+      - "traefik.http.routers.peperless-rtr.tls=true"
+      ## Middlewares
+      # - "traefik.http.middlewares.paperless-stripprefix.stripprefix.prefixes=/paperless"
+      - "traefik.http.routers.paperless-rtr.middlewares=chain-no-auth@file"
+      ## HTTP Services
+      - "traefik.http.routers.paperless-rtr.service=paperless-svc"
+      - "traefik.http.services.paperless-svc.loadbalancer.server.port=8000"
+
+############################# MAINTENANCE
+
+# Docker-GC - Automatic Docker Garbage Collection
+  # Create docker-gc-exclude file
+  dockergc:
+    <<: *common-keys-apps # See EXTENSION FIELDS at the top
+    image: clockworksoul/docker-gc-cron:latest
+    container_name: docker-gc
+    networks:
+      - socket_proxy
+    volumes:
+      # - /var/run/docker.sock:/var/run/docker.sock # Use Docker Socket Proxy instead for improved security
+      - $DOCKERDIR/docker-gc/docker-gc-exclude:/etc/docker-gc-exclude
+    environment:
+      CRON: 0 0 0 * * ? # Everyday at midnight. Previously 0 0 * * *
+      FORCE_IMAGE_REMOVAL: 1
+      FORCE_CONTAINER_REMOVAL: 0
+      GRACE_PERIOD_SECONDS: 604800
+      DRY_RUN: 0
+      CLEAN_UP_VOLUMES: 1
+      TZ: $TZ
+      DOCKER_HOST: tcp://socket-proxy:2375
+
+# Cloudflare-Companion - Automatic CNAME DNS Creation
+  cf-companion:
+    <<: *common-keys-core # See EXTENSION FIELDS at the top
+    container_name: cf-companion
+    image: tiredofit/traefik-cloudflare-companion:latest
+    networks:
+      - socket_proxy
+    restart: always
+    environment:
+      - TIMEZONE=$TZ
+      - TRAEFIK_VERSION=2
+      - CF_EMAIL=$CLOUDFLARE_EMAIL # Same as traefik
+      - CF_TOKEN=$CLOUDFLARE_API_KEY
+      - TARGET_DOMAIN=$DOMAINNAME
+      - DOMAIN1=$DOMAINNAME
+      - DOMAIN1_ZONE_ID=$CLOUDFLARE_ZONEID # Copy from Cloudflare Overview page
+      - DOMAIN1_PROXIED=TRUE
+      - DOCKER_HOST=tcp://socket-proxy:2375
+    secrets:
+      - cf_email
+      - cf_api_key
+    
+    labels:
+      # Add hosts specified in rules here to force cf-companion to create the CNAMEs
+      # Since cf-companion creates CNAMEs based on host rules, this a workaround for non-docker/external apps
+      - "traefik.http.routers.cf-companion-rtr.rule=HostHeader(`pihole.$DOMAINNAME`) || HostHeader(`hass.$DOMAINNAME`) || HostHeader(`octoprint.$DOMAINNAME`) || HostHeader(`unifi.$DOMAINNAME`)"
+
+########################### NETWORK
+
+# Smokeping - A deluxe latency measurement tool.
+  smokeping:
+    <<: *common-keys-apps # See EXTENSION FIELDS at the top
+    image: ghcr.io/linuxserver/smokeping
+    container_name: smokeping
+    environment:
+      <<: *default-tz-puid-pgid
+    volumes:
+      - $DOCKERDIR/smokeping/config:/config
+      - $DOCKERDIR/smokeping/data:/data
+    # ports:
+    #   - 85:80
+    labels:
+      # homepage
+      - homepage.group=Netwerk
+      - homepage.name=Smokeping
+      - homepage.icon=smokeping.png
+      - homepage.href=https://smokeping.$DOMAINNAME
+      - homepage.description=latency measurement tool.
+      # reverse proxy
+      - "traefik.enable=true"
+      - "traefik.frontend.headers.customFrameOptionsValue=https://organizr.gladsheimr.nl"
+      ## HTTP Routers
+      - "traefik.http.routers.statping-rtr.entrypoints=https"
+      - "traefik.http.routers.statping-rtr.rule=Host(`smokeping.$DOMAINNAME`)"
+      ## Middlewares
+      - "traefik.http.routers.statping-rtr.middlewares=chain-authelia@file"
+      ## HTTP Services
+      - "traefik.http.routers.statping-rtr.service=statping-svc"
+      - "traefik.http.services.statping-svc.loadbalancer.server.port=80"
+
+# UniFi Controller - The Unifi-controller software is a powerful, enterprise wireless software engine ideal for high-density client deployments requiring low latency and high uptime performance.
+  unifi:
+    container_name: unifi
+    image: ghcr.io/linuxserver/unifi-controller
+    restart: always
+    networks:
+      - t2_proxy
+    security_opt:
+      - no-new-privileges:true
+    ports:
+    - target: 3478
+      published: 3478
+      protocol: udp
+      mode: host
+    - target: 10001
+      published: 10001
+      protocol: udp
+      mode: host
+    - target: 8080
+      published: 8080
+      protocol: tcp
+      mode: host
+    - target: 8081
+      published: 8081
+      protocol: tcp
+      mode: host
+    - target: 8443
+      published: 8343
+      protocol: tcp
+      mode: host
+    - target: 8880
+      published: 8880
+      protocol: tcp
+      mode: host
+    - target: 6789
+      published: 6789
+      protocol: tcp
+      mode: host
+    volumes:
+      - ${DOCKERDIR}/unifi:/config
+      - ${DOCKERDIR}/docker/shared:/shared
+    environment:
+      UNIFI_UID: $PUID
+      UNIFI_GID: $PGID
+      TZ: $TZ
+      RUNAS_UID0: "false"
+      BIND_PRIV: "false"
+    labels:
+      # homepage
+      - homepage.group=Netwerk
+      - homepage.name=Unifi
+      - homepage.icon=unifi.png
+      - homepage.href=https://bragi:8343
+      - homepage.description=Unifi-controller software
+      - homepage.widget.type=unifi
+      - homepage.widget.url=https://bragi:8343
+      - homepage.widget.username=$UNIFI_USER
+      - homepage.widget.password=$UNIFI_PASS
+      # reverse proxy
+    # labels:
+    #   - "traefik.enable=true"
+    #   ## HTTP Routers
+    #   - "traefik.http.routers.unifi.entrypoints=websecure"
+    #   - "traefik.http.routers.unifi.tls=true"
+    #   - "traefik.http.routers.unifi.tls.certresolver=myresolver"
+    #   - "traefik.http.routers.unifi-rtr.entrypoints=https"
+    #   - "traefik.http.routers.unifi-rtr.rule=HostHeader(`unifi.$DOMAINNAME`)"
+    #   ## Middlewares
+    #   - "traefik.http.routers.unifi-rtr.middlewares=chain-authelia@file"
+    #   ## HTTP Services
+    #   - "traefik.http.routers.unifi-rtr.service=unifi-svc"
+    #   - "traefik.http.services.unifi.loadbalancer.server.scheme=https"
+    #   - "traefik.http.services.unifi-svc.loadbalancer.server.port=8443"
