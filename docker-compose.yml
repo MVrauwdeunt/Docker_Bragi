@@ -1556,6 +1556,7 @@ services:
       - homepage.widget.username=$UNIFI_USER
       - homepage.widget.password=$UNIFI_PASS
       # reverse proxy
+      
     #   - "traefik.enable=true"
     #   ## HTTP Routers
     #   - "traefik.http.routers.unifi.entrypoints=websecure"
